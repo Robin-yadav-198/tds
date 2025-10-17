@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import json
@@ -147,10 +146,8 @@ async def attachment_to_gemini_part(attachment_url: str) -> Optional[dict]:
     return None
 
 # ------------------------- Filesystem Save Helpers -------------------------
-async def save_generated_files_locally(task_id: str, files: dict) -> str:
-    base_dir = os.path.join(os.getcwd(), "generated_tasks")
-    task_dir = os.path.join(base_dir, task_id)
-    safe_makedirs(task_dir)
+async def save_generated_files_locally(task_dir: str, files: dict) -> None:
+    """Save generated files to the specified task directory."""
     logger.info(f"[LOCAL_SAVE] Saving generated files to: {task_dir}")
     for filename, content in files.items():
         file_path = os.path.join(task_dir, filename)
@@ -162,7 +159,6 @@ async def save_generated_files_locally(task_id: str, files: dict) -> str:
             logger.exception(f"Failed to save generated file {filename}: {e}")
             raise
     flush_logs()
-    return task_dir
 
 async def save_attachments_locally(task_dir: str, attachments: List[Attachment]) -> List[str]:
     saved_files = []
@@ -322,14 +318,14 @@ async def call_gemini_api(contents: list, system_prompt: str, response_schema: d
             await asyncio.sleep(delay)
     raise Exception("LLM generation failed after retries")
 
-# ------------------------- Round 2 surgical update (Base.py style) -------------------------
-async def call_llm_round2_surgical_update(task_id: str, brief: str, existing_index_html: str) -> dict:
+# ------------------------- Round 2 surgical update -------------------------
+async def call_llm_round2_surgical_update(task_id: str, brief: str, existing_index_html: str, existing_readme: str, existing_license: str) -> dict:
     system_prompt = (
-        "You are an expert full-stack engineer tasked with making SURGICAL and MINIMAL changes. "
-        "Your MOST CRITICAL instruction is to preserve the existing application's core logic and structure. "
+        "You are an expert full-stack engineer performing SURGICAL and MINIMAL updates. "
+        "CRITICAL: Preserve ALL existing functionality, scripts, event handlers, and core logic. "
         "Only apply the specific changes requested in the 'New Brief'. "
         "Return a JSON object with 'index.html', 'README.md', and 'LICENSE'. "
-        "If README.md / LICENSE exist, copy them verbatim unless a change is strictly required."
+        "If no changes are needed to README.md or LICENSE, return them EXACTLY as provided."
     )
     response_schema = {
         "type": "OBJECT",
@@ -340,44 +336,64 @@ async def call_llm_round2_surgical_update(task_id: str, brief: str, existing_ind
         },
         "required": ["index.html", "README.md", "LICENSE"]
     }
+    
     prompt = (
-        f"UPDATE INSTRUCTION (SAFE MODE):\n\n"
-        f"New Brief: {brief}\n\n"
-        f"--- EXISTING index.html START ---\n{existing_index_html}\n--- EXISTING index.html END ---\n\n"
-        "Only make the minimal changes necessary to implement the brief. Do NOT remove or break core scripts, event handlers, or layout. "
-        "Return FULL JSON with 'index.html', 'README.md', 'LICENSE'. If you make no changes to README/LICENSE, copy their existing contents."
+        f"SURGICAL UPDATE REQUEST:\n\n"
+        f"Brief: {brief}\n\n"
+        f"--- EXISTING index.html ---\n{existing_index_html}\n--- END index.html ---\n\n"
+        f"--- EXISTING README.md ---\n{existing_readme}\n--- END README.md ---\n\n"
+        f"--- EXISTING LICENSE ---\n{existing_license}\n--- END LICENSE ---\n\n"
+        "Instructions:\n"
+        "1. Apply ONLY the changes described in the brief to index.html\n"
+        "2. Preserve ALL existing functionality, imports, and structure\n"
+        "3. Update README.md ONLY if the brief requires documentation changes\n"
+        "4. Keep LICENSE unchanged unless explicitly requested\n"
+        "5. Return complete, functional files - not diffs or snippets"
     )
 
     contents = [{"parts": [{"text": prompt}]}]
 
     try:
-        result = await call_gemini_api(contents=contents, system_prompt=system_prompt, response_schema=response_schema, max_retries=4, timeout=90)
+        result = await call_gemini_api(
+            contents=contents, 
+            system_prompt=system_prompt, 
+            response_schema=response_schema, 
+            max_retries=4, 
+            timeout=90
+        )
     except Exception as e:
         logger.exception(f"[ROUND2] LLM call failed: {e}")
-        # Fallback: return existing index.html and placeholders for readme/license
-        return {"index.html": existing_index_html or "<!-- original index.html preserved due to LLM failure -->",
-                "README.md": "", "LICENSE": ""}
+        # Fallback: return existing files unchanged
+        return {
+            "index.html": existing_index_html or "<!-- original preserved due to LLM failure -->",
+            "README.md": existing_readme or "",
+            "LICENSE": existing_license or ""
+        }
 
-    # Safety checks (Safe Mode)
+    # Enhanced safety checks
     new_html = (result.get("index.html") or "").strip()
-    if not new_html:
-        logger.warning("[SAFE] LLM returned empty index.html — reverting to existing.")
+    if not new_html or len(new_html) < 100:
+        logger.warning("[SAFE] LLM returned invalid/empty index.html — reverting to existing.")
         result["index.html"] = existing_index_html
     else:
-        # If LLM output is grossly shorter than original (possible destructive rewrite), reject it.
-        try:
-            orig_len = len(existing_index_html or "")
-            new_len = len(new_html)
-            if orig_len > 0 and new_len < max(200, int(orig_len * 0.3)):  # threshold: not less than 30% (and at least 200 chars)
-                logger.warning("[SAFE] LLM index.html appears destructive (too small). Reverting to existing.")
-                result["index.html"] = existing_index_html
-        except Exception:
-            # if anything goes wrong in safety checks, revert
+        # Check for destructive changes (less aggressive threshold)
+        orig_len = len(existing_index_html or "")
+        new_len = len(new_html)
+        
+        # Only reject if dramatically smaller (less than 50% and less than 500 chars)
+        if orig_len > 500 and new_len < max(500, int(orig_len * 0.5)):
+            logger.warning(f"[SAFE] LLM output suspiciously small ({new_len} vs {orig_len}) — reverting.")
+            result["index.html"] = existing_index_html
+        
+        # Check for essential HTML structure
+        if not re.search(r'<html|<!DOCTYPE', new_html, re.IGNORECASE):
+            logger.warning("[SAFE] LLM output missing HTML structure — reverting.")
             result["index.html"] = existing_index_html
 
-    # Ensure README and LICENSE exist (if LLM didn't return them)
-    result["README.md"] = result.get("README.md") or ""
-    result["LICENSE"] = result.get("LICENSE") or ""
+    # Ensure README and LICENSE exist
+    result["README.md"] = result.get("README.md") or existing_readme or ""
+    result["LICENSE"] = result.get("LICENSE") or existing_license or ""
+    
     return result
 
 # ------------------------- Notifier -------------------------
@@ -450,36 +466,38 @@ async def generate_files_and_deploy(task_data: TaskRequest):
         # Setup repo (init or clone)
         repo = await setup_local_repo(local_path, repo_name, repo_url_auth, repo_url_http, round_index)
 
-        # --- Prepare attachment data for LLM ---
-        image_parts = []
-        for attachment in attachments:
-            part = await attachment_to_gemini_part(attachment.url)
-            if part:
-                image_parts.append(part)
-
-        # Build explicit file reference list for LLM
+        # Build attachment descriptions
         attachment_descriptions = ""
         if attachments:
-            attachment_descriptions = "\nThe following attachments are provided (saved in the same folder):\n"
+            attachment_descriptions = "\n\nATTACHMENTS PROVIDED:\n"
             for att in attachments:
                 attachment_descriptions += f"- {att.name}\n"
             attachment_descriptions += (
-                "Use these exact file names in your HTML (for example: "
-                "<img src='sample.png'>). Do NOT rename or use external links.\n"
+                "\nIMPORTANT: Reference these files using their exact names (e.g., <img src='sample.png'>). "
+                "Do NOT use external URLs or rename files.\n"
             )
 
         # --- Round 1: Full generation ---
         if round_index == 1:
             logger.info("[WORKFLOW] Round 1: full generation")
 
-            # Add filenames info directly to the LLM prompt
-            enriched_brief = f"{brief}\n\n{attachment_descriptions}".strip()
+            # Prepare image parts for LLM
+            image_parts = []
+            for attachment in attachments:
+                part = await attachment_to_gemini_part(attachment.url)
+                if part:
+                    image_parts.append(part)
+
+            enriched_brief = f"{brief}{attachment_descriptions}".strip()
 
             system_prompt = (
-                "You are an expert full-stack engineer. Produce a JSON object with keys 'index.html', 'README.md', and 'LICENSE'. "
-                "index.html must be a single-file responsive HTML app using Tailwind CSS. "
-                "If image attachments are mentioned below, reference them using <img src='filename'> exactly as provided. "
-                "README.md should be professional, LICENSE should contain the full MIT license text."
+                "You are an expert full-stack engineer. Create a complete, production-ready single-page application. "
+                "Return a JSON object with 'index.html', 'README.md', and 'LICENSE'. "
+                "\n\nREQUIREMENTS:"
+                "\n- index.html: Self-contained, responsive HTML using Tailwind CSS via CDN"
+                "\n- If attachments are mentioned, reference them exactly as: <img src='filename'>"
+                "\n- README.md: Professional documentation with setup, usage, and features"
+                "\n- LICENSE: Complete MIT license text with current year and author"
             )
 
             response_schema = {
@@ -508,39 +526,57 @@ async def generate_files_and_deploy(task_data: TaskRequest):
 
         # --- Round 2+: Surgical Update ---
         else:
-            logger.info("[WORKFLOW] Round 2+: surgical update (Base.py style). Loading existing index.html only.")
+            logger.info(f"[WORKFLOW] Round {round_index}: surgical update")
+            
+            # Read existing files
             existing_index_html = ""
+            existing_readme = ""
+            existing_license = ""
+            
             idx_path = os.path.join(local_path, "index.html")
+            readme_path = os.path.join(local_path, "README.md")
+            license_path = os.path.join(local_path, "LICENSE")
+            
             if os.path.exists(idx_path):
                 try:
                     with open(idx_path, "r", encoding="utf-8") as f:
                         existing_index_html = f.read()
-                    logger.info("[WORKFLOW] Read existing index.html for context.")
+                    logger.info(f"[WORKFLOW] Read existing index.html ({len(existing_index_html)} bytes)")
                 except Exception as e:
-                    logger.warning(f"[WORKFLOW] Could not read existing index.html: {e}")
-                    existing_index_html = ""
+                    logger.warning(f"[WORKFLOW] Could not read index.html: {e}")
+            
+            if os.path.exists(readme_path):
+                try:
+                    with open(readme_path, "r", encoding="utf-8") as f:
+                        existing_readme = f.read()
+                    logger.info(f"[WORKFLOW] Read existing README.md ({len(existing_readme)} bytes)")
+                except Exception as e:
+                    logger.warning(f"[WORKFLOW] Could not read README.md: {e}")
+            
+            if os.path.exists(license_path):
+                try:
+                    with open(license_path, "r", encoding="utf-8") as f:
+                        existing_license = f.read()
+                    logger.info(f"[WORKFLOW] Read existing LICENSE ({len(existing_license)} bytes)")
+                except Exception as e:
+                    logger.warning(f"[WORKFLOW] Could not read LICENSE: {e}")
 
-            # Add attachments info to round 2 prompt as well
-            brief_with_attachments = f"{brief}\n\n{attachment_descriptions}".strip()
+            brief_with_attachments = f"{brief}{attachment_descriptions}".strip()
+            
             generated = await call_llm_round2_surgical_update(
-                task_id=task_id, brief=brief_with_attachments, existing_index_html=existing_index_html
+                task_id=task_id,
+                brief=brief_with_attachments,
+                existing_index_html=existing_index_html,
+                existing_readme=existing_readme,
+                existing_license=existing_license
             )
 
-            # Preserve README/LICENSE if LLM didn’t return them
-            readme_path = os.path.join(local_path, "README.md")
-            license_path = os.path.join(local_path, "LICENSE")
-            if not generated.get("README.md") and os.path.exists(readme_path):
-                with open(readme_path, "r", encoding="utf-8") as f:
-                    generated["README.md"] = f.read()
-            if not generated.get("LICENSE") and os.path.exists(license_path):
-                with open(license_path, "r", encoding="utf-8") as f:
-                    generated["LICENSE"] = f.read()
+        # Save generated files
+        await save_generated_files_locally(local_path, generated)
 
-        # Save generated files locally
-        await save_generated_files_locally(task_id, generated)
-
-        # Save attachments into repo folder
-        await save_attachments_locally(os.path.join(base_dir, task_id), attachments)
+        # Save attachments (for ALL rounds, including Round 2+)
+        if attachments:
+            await save_attachments_locally(local_path, attachments)
 
         # Commit and publish
         deployment_info = await commit_and_publish(repo, task_id, round_index, repo_name)
