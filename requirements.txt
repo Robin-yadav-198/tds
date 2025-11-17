@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
-pydantic
 httpx
-GitPython
-python-dotenv
-pydantic[email]
+gitpython
+pydantic
 pydantic-settings
+python-multipart
