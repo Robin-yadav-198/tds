@@ -66,7 +66,7 @@ def flush_logs():
 # ------------------------- Models -------------------------
 class Attachment(BaseModel):
     name: str
-    url: str  # data URI or http(s) url
+    url: str
 
 class TaskRequest(BaseModel):
     task: str
@@ -79,7 +79,7 @@ class TaskRequest(BaseModel):
     attachments: List[Attachment] = []
 
 # ------------------------- App & Globals -------------------------
-app = FastAPI(title="Automated Task Receiver & Processor", description="LLM-driven code generation and deployment")
+app = FastAPI(title="Automated Task Receiver & Processor")
 background_tasks_list: List[asyncio.Task] = []
 task_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_TASKS)
 last_received_task: Optional[dict] = None
@@ -151,6 +151,12 @@ async def save_generated_files_locally(task_dir: str, files: dict) -> None:
     logger.info(f"[LOCAL_SAVE] Saving generated files to: {task_dir}")
     for filename, content in files.items():
         file_path = os.path.join(task_dir, filename)
+        
+        # Create subdirectories if needed (e.g., .github/workflows/)
+        file_dir = os.path.dirname(file_path)
+        if file_dir and file_dir != task_dir:
+            safe_makedirs(file_dir)
+        
         try:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -161,7 +167,12 @@ async def save_generated_files_locally(task_dir: str, files: dict) -> None:
     flush_logs()
 
 async def save_attachments_locally(task_dir: str, attachments: List[Attachment]) -> List[str]:
+    """Save attachments to task directory - works for ALL rounds"""
     saved_files = []
+    if not attachments:
+        logger.info("[ATTACHMENTS] No attachments to save")
+        return saved_files
+        
     logger.info(f"[ATTACHMENTS] Processing {len(attachments)} attachments for {task_dir}")
     async with httpx.AsyncClient(timeout=30) as client:
         for attachment in attachments:
@@ -173,7 +184,7 @@ async def save_attachments_locally(task_dir: str, attachments: List[Attachment])
                 continue
             try:
                 if url.startswith("data:"):
-                    m = re.search(r"base64,(.*)", url, re.IGNORECASE)
+                    m = re.search(r"base64,(.*)", url, re.IGNORECASE | re.DOTALL)
                     if m:
                         file_bytes = base64.b64decode(m.group(1))
                 elif url.startswith(("http://", "https://")):
@@ -269,7 +280,7 @@ async def commit_and_publish(repo: git.Repo, task_id: str, round_index: int, rep
                     logger.exception(f"[GIT] Pages configuration failed: {text}")
                     raise
 
-            await asyncio.sleep(5)  # allow pages to deploy
+            await asyncio.sleep(5)
             pages_url = f"{settings.GITHUB_PAGES_BASE}/{repo_name}/"
             flush_logs()
             return {"repo_url": repo_url_http, "commit_sha": commit_sha, "pages_url": pages_url}
@@ -319,38 +330,49 @@ async def call_gemini_api(contents: list, system_prompt: str, response_schema: d
     raise Exception("LLM generation failed after retries")
 
 # ------------------------- Round 2 surgical update -------------------------
-async def call_llm_round2_surgical_update(task_id: str, brief: str, existing_index_html: str, existing_readme: str, existing_license: str) -> dict:
+async def call_llm_round2_surgical_update(task_id: str, brief: str, existing_files: dict) -> dict:
+    """
+    Perform surgical update on existing files.
+    existing_files: dict with keys like 'index.html', 'README.md', 'LICENSE', etc.
+    """
     system_prompt = (
-        "You are an expert full-stack engineer performing SURGICAL and MINIMAL updates. "
-        "CRITICAL: Preserve ALL existing functionality, scripts, event handlers, and core logic. "
-        "Only apply the specific changes requested in the 'New Brief'. "
-        "Return a JSON object with 'index.html', 'README.md', and 'LICENSE'. "
-        "If no changes are needed to README.md or LICENSE, return them EXACTLY as provided."
+        "You are an expert full-stack engineer performing PRECISE, SURGICAL updates. "
+        "CRITICAL RULES:\n"
+        "1. Apply ONLY the specific changes requested in the brief\n"
+        "2. PRESERVE all existing functionality, scripts, event handlers, and core logic\n"
+        "3. If the brief mentions adding features, ADD them WITHOUT removing existing features\n"
+        "4. Return ALL files that exist, even if unchanged\n"
+        "5. For files not mentioned in the brief, return them EXACTLY as provided\n"
+        "6. Ensure all generated files are complete and functional\n\n"
+        "Return a JSON object with keys matching the file names provided."
     )
+    
+    # Build the file list for the schema
+    file_properties = {}
+    for filename in existing_files.keys():
+        file_properties[filename] = {"type": "STRING"}
+    
     response_schema = {
         "type": "OBJECT",
-        "properties": {
-            "index.html": {"type": "STRING"},
-            "README.md": {"type": "STRING"},
-            "LICENSE": {"type": "STRING"},
-        },
-        "required": ["index.html", "README.md", "LICENSE"]
+        "properties": file_properties,
+        "required": list(existing_files.keys())
     }
     
-    prompt = (
-        f"SURGICAL UPDATE REQUEST:\n\n"
-        f"Brief: {brief}\n\n"
-        f"--- EXISTING index.html ---\n{existing_index_html}\n--- END index.html ---\n\n"
-        f"--- EXISTING README.md ---\n{existing_readme}\n--- END README.md ---\n\n"
-        f"--- EXISTING LICENSE ---\n{existing_license}\n--- END LICENSE ---\n\n"
+    # Build prompt with all existing files
+    prompt_parts = [f"SURGICAL UPDATE REQUEST:\n\nBrief: {brief}\n\n"]
+    prompt_parts.append("EXISTING FILES:\n")
+    for filename, content in existing_files.items():
+        prompt_parts.append(f"--- {filename} ---\n{content}\n--- END {filename} ---\n\n")
+    
+    prompt_parts.append(
         "Instructions:\n"
-        "1. Apply ONLY the changes described in the brief to index.html\n"
-        "2. Preserve ALL existing functionality, imports, and structure\n"
-        "3. Update README.md ONLY if the brief requires documentation changes\n"
-        "4. Keep LICENSE unchanged unless explicitly requested\n"
-        "5. Return complete, functional files - not diffs or snippets"
+        "1. Apply the requested changes carefully\n"
+        "2. Preserve ALL existing functionality\n"
+        "3. Return complete, functional files - not diffs or snippets\n"
+        "4. For files not affected by the brief, return them unchanged\n"
     )
-
+    
+    prompt = "".join(prompt_parts)
     contents = [{"parts": [{"text": prompt}]}]
 
     try:
@@ -359,40 +381,37 @@ async def call_llm_round2_surgical_update(task_id: str, brief: str, existing_ind
             system_prompt=system_prompt, 
             response_schema=response_schema, 
             max_retries=4, 
-            timeout=90
+            timeout=120
         )
     except Exception as e:
         logger.exception(f"[ROUND2] LLM call failed: {e}")
         # Fallback: return existing files unchanged
-        return {
-            "index.html": existing_index_html or "<!-- original preserved due to LLM failure -->",
-            "README.md": existing_readme or "",
-            "LICENSE": existing_license or ""
-        }
+        logger.warning("[ROUND2] Returning existing files due to LLM failure")
+        return existing_files.copy()
 
-    # Enhanced safety checks
-    new_html = (result.get("index.html") or "").strip()
-    if not new_html or len(new_html) < 100:
-        logger.warning("[SAFE] LLM returned invalid/empty index.html — reverting to existing.")
-        result["index.html"] = existing_index_html
-    else:
-        # Check for destructive changes (less aggressive threshold)
-        orig_len = len(existing_index_html or "")
-        new_len = len(new_html)
+    # Validate and sanitize results
+    for filename in existing_files.keys():
+        new_content = (result.get(filename) or "").strip()
         
-        # Only reject if dramatically smaller (less than 50% and less than 500 chars)
-        if orig_len > 500 and new_len < max(500, int(orig_len * 0.5)):
-            logger.warning(f"[SAFE] LLM output suspiciously small ({new_len} vs {orig_len}) — reverting.")
-            result["index.html"] = existing_index_html
+        # Basic validation - ensure content isn't empty or suspiciously small
+        if not new_content or len(new_content) < 50:
+            logger.warning(f"[SAFE] LLM returned invalid/empty {filename} — reverting to existing.")
+            result[filename] = existing_files[filename]
+            continue
         
-        # Check for essential HTML structure
-        if not re.search(r'<html|<!DOCTYPE', new_html, re.IGNORECASE):
-            logger.warning("[SAFE] LLM output missing HTML structure — reverting.")
-            result["index.html"] = existing_index_html
-
-    # Ensure README and LICENSE exist
-    result["README.md"] = result.get("README.md") or existing_readme or ""
-    result["LICENSE"] = result.get("LICENSE") or existing_license or ""
+        # For HTML files, check for basic structure
+        if filename.endswith('.html'):
+            if not re.search(r'<html|<!DOCTYPE', new_content, re.IGNORECASE):
+                logger.warning(f"[SAFE] {filename} missing HTML structure — reverting.")
+                result[filename] = existing_files[filename]
+                continue
+            
+            # Check for dramatic size reduction (less than 40% of original)
+            orig_len = len(existing_files[filename])
+            new_len = len(new_content)
+            if orig_len > 500 and new_len < int(orig_len * 0.4):
+                logger.warning(f"[SAFE] {filename} suspiciously small ({new_len} vs {orig_len}) — reverting.")
+                result[filename] = existing_files[filename]
     
     return result
 
@@ -473,8 +492,14 @@ async def generate_files_and_deploy(task_data: TaskRequest):
             for att in attachments:
                 attachment_descriptions += f"- {att.name}\n"
             attachment_descriptions += (
-                "\nIMPORTANT: Reference these files using their exact names (e.g., <img src='sample.png'>). "
-                "Do NOT use external URLs or rename files.\n"
+                "\nCRITICAL: You MUST create these files with appropriate content. "
+                "Reference them using their exact names (e.g., <img src='filename.png'>). "
+                "Generate realistic content for each file type:\n"
+                "- .txt files: Generate relevant text content\n"
+                "- .json files: Generate valid JSON with appropriate structure\n"
+                "- .csv files: Generate CSV data with headers and rows\n"
+                "- .svg files: Generate valid SVG markup\n"
+                "- .md files: Generate markdown content\n"
             )
 
         # --- Round 1: Full generation ---
@@ -491,22 +516,44 @@ async def generate_files_and_deploy(task_data: TaskRequest):
             enriched_brief = f"{brief}{attachment_descriptions}".strip()
 
             system_prompt = (
-                "You are an expert full-stack engineer. Create a complete, production-ready single-page application. "
-                "Return a JSON object with 'index.html', 'README.md', and 'LICENSE'. "
-                "\n\nREQUIREMENTS:"
-                "\n- index.html: Self-contained, responsive HTML using Tailwind CSS via CDN"
-                "\n- If attachments are mentioned, reference them exactly as: <img src='filename'>"
-                "\n- README.md: Professional documentation with setup, usage, and features"
-                "\n- LICENSE: Complete MIT license text with current year and author"
+                "You are an expert full-stack engineer. Create a complete, production-ready application.\n\n"
+                "CRITICAL REQUIREMENTS:\n"
+                "1. Generate ALL files mentioned in the attachments list - create realistic content for each\n"
+                "2. For data files (.json, .csv, .txt), generate appropriate realistic data\n"
+                "3. For SVG files, create valid SVG markup with the described imagery\n"
+                "4. index.html: Self-contained, responsive HTML using Tailwind CSS via CDN\n"
+                "5. Reference attachments exactly as: <img src='filename'> or fetch('filename')\n"
+                "6. README.md: Professional documentation with setup, usage, and features\n"
+                "7. LICENSE: Complete MIT license text with current year\n"
+                "8. For tasks requiring CI/CD, create .github/workflows/ci.yml with appropriate steps\n"
+                "9. For Python tasks, create execute.py and requirements.txt if needed\n\n"
+                "Return a JSON object with keys for EVERY file needed (index.html, README.md, LICENSE, "
+                "and ALL attachment files mentioned, plus any CI/CD files if applicable)."
             )
+
+            # Build schema dynamically based on attachments
+            file_properties = {
+                "index.html": {"type": "STRING"},
+                "README.md": {"type": "STRING"},
+                "LICENSE": {"type": "STRING"},
+            }
+            
+            # Add attachment files to schema
+            for att in attachments:
+                file_properties[att.name] = {"type": "STRING"}
+            
+            # Check if task requires CI/CD (contains "analyze", "ci", "workflow", etc.)
+            task_lower = task_id.lower()
+            brief_lower = brief.lower()
+            if any(keyword in task_lower or keyword in brief_lower for keyword in ['analyze', 'ci', 'workflow', 'github actions', 'execute.py']):
+                file_properties[".github/workflows/ci.yml"] = {"type": "STRING"}
+                if 'python' in brief_lower or 'execute.py' in brief_lower:
+                    file_properties["execute.py"] = {"type": "STRING"}
+                    file_properties["requirements.txt"] = {"type": "STRING"}
 
             response_schema = {
                 "type": "OBJECT",
-                "properties": {
-                    "index.html": {"type": "STRING"},
-                    "README.md": {"type": "STRING"},
-                    "LICENSE": {"type": "STRING"},
-                },
+                "properties": file_properties,
                 "required": ["index.html", "README.md", "LICENSE"],
             }
 
@@ -523,60 +570,56 @@ async def generate_files_and_deploy(task_data: TaskRequest):
                 max_retries=4,
                 timeout=120,
             )
+            
+            # Ensure all required files exist
+            for att in attachments:
+                if att.name not in generated or not generated[att.name].strip():
+                    logger.warning(f"[ROUND1] LLM didn't generate {att.name}, will save from attachment")
 
         # --- Round 2+: Surgical Update ---
         else:
             logger.info(f"[WORKFLOW] Round {round_index}: surgical update")
             
-            # Read existing files
-            existing_index_html = ""
-            existing_readme = ""
-            existing_license = ""
+            # Read ALL existing files from repo
+            existing_files = {}
             
-            idx_path = os.path.join(local_path, "index.html")
-            readme_path = os.path.join(local_path, "README.md")
-            license_path = os.path.join(local_path, "LICENSE")
-            
-            if os.path.exists(idx_path):
-                try:
-                    with open(idx_path, "r", encoding="utf-8") as f:
-                        existing_index_html = f.read()
-                    logger.info(f"[WORKFLOW] Read existing index.html ({len(existing_index_html)} bytes)")
-                except Exception as e:
-                    logger.warning(f"[WORKFLOW] Could not read index.html: {e}")
-            
-            if os.path.exists(readme_path):
-                try:
-                    with open(readme_path, "r", encoding="utf-8") as f:
-                        existing_readme = f.read()
-                    logger.info(f"[WORKFLOW] Read existing README.md ({len(existing_readme)} bytes)")
-                except Exception as e:
-                    logger.warning(f"[WORKFLOW] Could not read README.md: {e}")
-            
-            if os.path.exists(license_path):
-                try:
-                    with open(license_path, "r", encoding="utf-8") as f:
-                        existing_license = f.read()
-                    logger.info(f"[WORKFLOW] Read existing LICENSE ({len(existing_license)} bytes)")
-                except Exception as e:
-                    logger.warning(f"[WORKFLOW] Could not read LICENSE: {e}")
+            # Walk the entire repo to find all files
+            for root, dirs, files in os.walk(local_path):
+                # Skip .git directory
+                if '.git' in root:
+                    continue
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, local_path)
+                    
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            existing_files[relative_path] = content
+                            logger.info(f"[WORKFLOW] Read existing {relative_path} ({len(content)} bytes)")
+                    except Exception as e:
+                        logger.warning(f"[WORKFLOW] Could not read {relative_path}: {e}")
+
+            if not existing_files:
+                logger.error("[WORKFLOW] No existing files found in Round 2+! This is unexpected.")
+                # Fallback to treating as Round 1
+                raise Exception("No existing files found for Round 2+ update")
 
             brief_with_attachments = f"{brief}{attachment_descriptions}".strip()
             
             generated = await call_llm_round2_surgical_update(
                 task_id=task_id,
                 brief=brief_with_attachments,
-                existing_index_html=existing_index_html,
-                existing_readme=existing_readme,
-                existing_license=existing_license
+                existing_files=existing_files
             )
 
-        # Save generated files
+        # Save generated files (this will create subdirectories as needed)
         await save_generated_files_locally(local_path, generated)
 
-        # Save attachments (for ALL rounds, including Round 2+)
+        # ALWAYS save attachments (for ALL rounds)
         if attachments:
-            await save_attachments_locally(local_path, attachments)
+            saved_attachment_files = await save_attachments_locally(local_path, attachments)
+            logger.info(f"[ATTACHMENTS] Saved {len(saved_attachment_files)} attachment files")
 
         # Commit and publish
         deployment_info = await commit_and_publish(repo, task_id, round_index, repo_name)
@@ -672,7 +715,6 @@ async def get_logs(lines: int = Query(200, ge=1, le=5000)):
             buffer = bytearray()
             block_size = 1024
             blocks = 0
-            # Read from end until we have enough or hit limit
             while file_size > 0 and len(buffer) < lines * 2000 and blocks < 1024:
                 read_size = min(block_size, file_size)
                 f.seek(file_size - read_size)
